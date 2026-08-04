@@ -1,28 +1,22 @@
-"""
-Z-Chat WebRTC Signaling Server (1-1 Direct Call)
-------------------------------------------------
-pip install flask flask-socketio eventlet
-python server.py
-
-Client kết nối Socket.IO tới URL Render
-"""
-
 import os
-# BẮT BỘC: Patch eventlet trước khi import các thư viện khác
-import eventlet
-eventlet.monkey_patch()
+
+# BẮT BỘC 100%: Phải patch_all() ở dòng ĐẦU TIÊN trước các import khác!
+from gevent import monkey
+monkey.patch_all()
 
 from flask import Flask, request
+from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "zchat-webrtc-secret"
+CORS(app)
 
-# CORS: Cho phép tất cả origins, dùng eventlet cho Render
+# Khai báo async_mode="gevent"
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="eventlet",
+    async_mode="gevent",
     logger=False,
     engineio_logger=False,
 )
@@ -57,7 +51,6 @@ def on_disconnect():
     username = sid_to_user.pop(sid, None)
     if username and online_users.get(username) == sid:
         online_users.pop(username, None)
-        # Báo offline (tuỳ chọn)
         emit(
             "user_offline",
             {"username": username},
@@ -69,13 +62,11 @@ def on_disconnect():
 
 @socketio.on("register")
 def on_register(data):
-    """Client gửi { username } sau khi login ZChat."""
     username = _norm((data or {}).get("username"))
     if not username:
         emit("register_error", {"message": "username required"})
         return
 
-    # Nếu user cũ còn sid khác → đá sid cũ
     old_sid = online_users.get(username)
     if old_sid and old_sid != request.sid:
         sid_to_user.pop(old_sid, None)
@@ -94,11 +85,6 @@ def on_register(data):
 
 @socketio.on("call_user")
 def on_call_user(data):
-    """
-    Người gọi gửi:
-      { to, from, offer, callType? }
-    offer = RTCSessionDescriptionInit { type, sdp }
-    """
     data = data or {}
     to_user = _norm(data.get("to"))
     from_user = _norm(data.get("from") or sid_to_user.get(request.sid))
@@ -128,10 +114,6 @@ def on_call_user(data):
 
 @socketio.on("make_answer")
 def on_make_answer(data):
-    """
-    Người nhận bắt máy:
-      { to, from, answer }
-    """
     data = data or {}
     to_user = _norm(data.get("to"))
     from_user = _norm(data.get("from") or sid_to_user.get(request.sid))
@@ -159,10 +141,6 @@ def on_make_answer(data):
 
 @socketio.on("ice_candidate")
 def on_ice_candidate(data):
-    """
-    Relay ICE:
-      { to, from, candidate }
-    """
     data = data or {}
     to_user = _norm(data.get("to"))
     from_user = _norm(data.get("from") or sid_to_user.get(request.sid))
@@ -187,11 +165,6 @@ def on_ice_candidate(data):
 
 @socketio.on("end_call")
 def on_end_call(data):
-    """
-    Kết thúc / từ chối:
-      { to, from, reason? }
-    reason: hangup | reject | cancel
-    """
     data = data or {}
     to_user = _norm(data.get("to"))
     from_user = _norm(data.get("from") or sid_to_user.get(request.sid))
@@ -215,14 +188,12 @@ def on_end_call(data):
 
 @socketio.on("reject_call")
 def on_reject_call(data):
-    """Alias tiện dụng: từ chối cuộc gọi đến."""
     data = data or {}
     data["reason"] = "reject"
     on_end_call(data)
 
 
 if __name__ == "__main__":
-    # ĐỌC CỔNG TỪ BIẾN MÔI TRƯỜNG CỦA RENDER
     port = int(os.environ.get("PORT", 5000))
     print(f"Z-Chat signaling running on port {port}")
     socketio.run(app, host="0.0.0.0", port=port, debug=False)
