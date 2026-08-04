@@ -4,9 +4,13 @@ Z-Chat WebRTC Signaling Server (1-1 Direct Call)
 pip install flask flask-socketio eventlet
 python server.py
 
-Mặc định: http://0.0.0.0:5000
-Client kết nối Socket.IO tới cùng origin hoặc CORS cho zchat-org.pages.dev
+Client kết nối Socket.IO tới URL Render
 """
+
+import os
+# BẮT BỘC: Patch eventlet trước khi import các thư viện khác
+import eventlet
+eventlet.monkey_patch()
 
 from flask import Flask, request
 from flask_socketio import SocketIO, emit
@@ -14,11 +18,11 @@ from flask_socketio import SocketIO, emit
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "zchat-webrtc-secret"
 
-# CORS: cho phép front-end Pages + local
+# CORS: Cho phép tất cả origins, dùng eventlet cho Render
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="gevent",
+    async_mode="eventlet",
     logger=False,
     engineio_logger=False,
 )
@@ -218,5 +222,7 @@ def on_reject_call(data):
 
 
 if __name__ == "__main__":
-    print("Z-Chat signaling on http://0.0.0.0:5000")
-    socketio.run(app, host="0.0.0.0", port=5000, debug=False)
+    # ĐỌC CỔNG TỪ BIẾN MÔI TRƯỜNG CỦA RENDER
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Z-Chat signaling running on port {port}")
+    socketio.run(app, host="0.0.0.0", port=port, debug=False)
