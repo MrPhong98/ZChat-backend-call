@@ -193,6 +193,28 @@ def on_reject_call(data):
     on_end_call(data)
 
 
+@socketio.on("media_state")
+def on_media_state(data):
+    data = data or {}
+    to_user = _norm(data.get("to"))
+    from_user = _norm(data.get("from") or sid_to_user.get(request.sid))
+    if not to_user:
+        return
+    target_sid = online_users.get(to_user)
+    if not target_sid:
+        return
+    emit(
+        "media_state",
+        {
+            "from": from_user,
+            "video": data.get("video"),
+            "audio": data.get("audio"),
+        },
+        to=target_sid,
+    )
+
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Z-Chat signaling running on port {port}")
