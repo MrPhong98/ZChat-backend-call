@@ -1,16 +1,24 @@
+//! Z-Chat WebRTC signaling — Rust (Socket.IO / socketioxide)
+//! Compatible with webrtc.js (socket.io-client).
+//!
+//! Fix: mỗi client join room = username → emit theo username (ổn định hơn sid).
+
 use std::sync::Arc;
+
 use axum::{routing::get, Json, Router};
 use dashmap::DashMap;
-use serde_json::{json, Value};
+use serde::Deserialize;
+use serde_json::json;
 use socketioxide::{
-    extract::{Data, SocketRef},
+    extract::{Data, SocketRef, State},
     SocketIo,
 };
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{info, warn};
 
-type OnlineUsers = DashMap<String, String>; // username -> sid
-type SidToUser = DashMap<String, String>;   // sid -> username
+/// username (lower) -> sid (debug / kick old session)
+type OnlineUsers = DashMap<String, String>;
+type SidToUser = DashMap<String, String>;
 
 #[derive(Clone, Default)]
 struct AppState {
@@ -22,8 +30,8 @@ fn norm(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
-fn resolve_from(payload: &Value, sid: &str, state: &AppState) -> String {
-    if let Some(f) = payload.get("from").and_then(|v| v.as_str()) {
+fn resolve_from(payload_from: &Option<String>, sid: &str, state: &AppState) -> String {
+    if let Some(f) = payload_from {
         let n = norm(f);
         if !n.is_empty() {
             return n;
@@ -34,6 +42,49 @@ fn resolve_from(payload: &Value, sid: &str, state: &AppState) -> String {
         .get(sid)
         .map(|u| u.clone())
         .unwrap_or_default()
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterPayload {
+    username: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CallUserPayload {
+    to: Option<String>,
+    from: Option<String>,
+    offer: Option<serde_json::Value>,
+    #[serde(rename = "callType")]
+    call_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MakeAnswerPayload {
+    to: Option<String>,
+    from: Option<String>,
+    answer: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IceCandidatePayload {
+    to: Option<String>,
+    from: Option<String>,
+    candidate: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EndCallPayload {
+    to: Option<String>,
+    from: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MediaStatePayload {
+    to: Option<String>,
+    from: Option<String>,
+    video: Option<serde_json::Value>,
+    audio: Option<serde_json::Value>,
 }
 
 #[tokio::main]
@@ -48,14 +99,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::default();
     let (layer, io) = SocketIo::builder().with_state(state.clone()).build_layer();
 
-    let io_state = state.clone();
-    io.ns("/", move |socket: SocketRef| {
+    // Clone io for handlers that need server-wide emit (optional)
+    let _io = io.clone();
+
+    io.ns("/", |socket: SocketRef, state: State<AppState>| {
         info!("[connect] sid={}", socket.id);
         let sid_str = socket.id.to_string();
 
-        // disconnect → user_offline
         {
-            let st = io_state.clone();
+            let st = state.clone();
             let sref = socket.clone();
             let sid_str = sid_str.clone();
             socket.on_disconnect(move || {
@@ -65,16 +117,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 async move {
                     let username = st.sid_to_user.remove(&sid_str).map(|(_, u)| u);
                     if let Some(ref username) = username {
-                        let still_this = st
+                        let still = st
                             .online_users
                             .get(username)
                             .map(|s| s.as_str() == sid_str)
                             .unwrap_or(false);
-                        if still_this {
+                        if still {
                             st.online_users.remove(username);
-                            let _ = sref
-                                .broadcast()
-                                .emit("user_offline", json!({ "username": username }));
+                            let _ = sref.leave(username.clone());
+                            let _ = sref.broadcast().emit(
+                                "user_offline",
+                                json!({ "username": username }),
+                            );
                         }
                     }
                     info!("[disconnect] sid={} user={:?}", sid_str, username);
@@ -82,180 +136,203 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
 
-        // ── register ────────────────────────────────────────
-        let st = io_state.clone();
-        socket.on("register", move |socket: SocketRef, Data(data): Data<Value>| {
-            let st = st.clone();
-            async move {
-                let username = data.get("username").and_then(|v| v.as_str()).map(norm);
-                let Some(username) = username.filter(|s| !s.is_empty()) else {
-                    let _ = socket.emit("register_error", json!({ "message": "username required" }));
+        socket.on(
+            "register",
+            |socket: SocketRef, Data(data): Data<RegisterPayload>, state: State<AppState>| async move {
+                let username = data
+                    .username
+                    .as_deref()
+                    .map(norm)
+                    .filter(|s| !s.is_empty());
+                let Some(username) = username else {
+                    let _ = socket.emit(
+                        "register_error",
+                        json!({ "message": "username required" }),
+                    );
                     return;
                 };
 
                 let sid = socket.id.to_string();
 
-                if let Some((_, old_sid)) = st.online_users.remove(&username) {
+                // Kick session cũ cùng username
+                if let Some((_, old_sid)) = state.online_users.remove(&username) {
                     if old_sid != sid {
-                        st.sid_to_user.remove(&old_sid);
+                        state.sid_to_user.remove(&old_sid);
                     }
                 }
 
-                st.online_users.insert(username.clone(), sid.clone());
-                st.sid_to_user.insert(sid, username.clone());
-
-                // 👉 GROK FIX: Cho socket gia nhập Room theo đúng Username của mình
-                let _ = socket.leave_all();
-                let _ = socket.join(username.clone());
-
-                let online: Vec<String> = st.online_users.iter().map(|e| e.key().clone()).collect();
-
-                let _ = socket.emit("registered", json!({ "username": &username, "online": online }));
-                let _ = socket.broadcast().emit("user_online", json!({ "username": &username }));
-                info!("[register] {} joined room [{}] (sid={})", username, username, socket.id);
-            }
-        });
-
-        // ── call_user ───────────────────────────────────────
-        let st = io_state.clone();
-        socket.on("call_user", move |socket: SocketRef, Data(data): Data<Value>| {
-            let st = st.clone();
-            async move {
-                let to_user = data.get("to").and_then(|v| v.as_str()).map(norm).unwrap_or_default();
-                let from_user = resolve_from(&data, &socket.id.to_string(), &st);
-                let offer = data.get("offer");
-
-                if to_user.is_empty() || from_user.is_empty() || offer.is_none() {
-                    let _ = socket.emit("call_error", json!({ "message": "missing to/from/offer" }));
-                    return;
+                // Room = username → emit theo tên (webrtc.js gửi to: username)
+                let _ = socket.leave(username.clone());
+                if let Err(e) = socket.join(username.clone()) {
+                    warn!("[register] join room failed: {:?}", e);
                 }
 
-                if !st.online_users.contains_key(&to_user) {
-                    let _ = socket.emit("call_error", json!({ "message": "user_offline", "to": to_user }));
-                    return;
-                }
+                state.online_users.insert(username.clone(), sid.clone());
+                state.sid_to_user.insert(sid, username.clone());
 
-                let call_type = data.get("callType").and_then(|v| v.as_str()).unwrap_or("video");
+                let online: Vec<String> = state
+                    .online_users
+                    .iter()
+                    .map(|e| e.key().clone())
+                    .collect();
 
-                // 👉 GROK FIX: Emit thẳng vào Room có tên là `to_user`
-                let _ = socket.to(to_user.clone()).emit(
-                    "incoming_call",
-                    json!({
-                        "from": from_user,
-                        "offer": offer,
-                        "callType": call_type,
-                    }),
+                let _ = socket.emit(
+                    "registered",
+                    json!({ "username": &username, "online": online }),
                 );
-                info!("[call_user] {} -> room [{}]", from_user, to_user);
-            }
-        });
+                let _ = socket
+                    .broadcast()
+                    .emit("user_online", json!({ "username": &username }));
+                info!("[register] {} sid={} rooms=username", username, socket.id);
+            },
+        );
 
-        // ── make_answer ─────────────────────────────────────
-        let st = io_state.clone();
-        socket.on("make_answer", move |socket: SocketRef, Data(data): Data<Value>| {
-            let st = st.clone();
-            async move {
-                let to_user = data.get("to").and_then(|v| v.as_str()).map(norm).unwrap_or_default();
-                let from_user = resolve_from(&data, &socket.id.to_string(), &st);
-                let answer = data.get("answer");
+        socket.on(
+            "call_user",
+            |socket: SocketRef, Data(data): Data<CallUserPayload>, state: State<AppState>| async move {
+                let to_user = data.to.as_deref().map(norm).unwrap_or_default();
+                let from_user = resolve_from(&data.from, &socket.id.to_string(), &state);
 
-                if to_user.is_empty() || answer.is_none() {
-                    let _ = socket.emit("call_error", json!({ "message": "missing to/answer" }));
+                if to_user.is_empty() || from_user.is_empty() || data.offer.is_none() {
+                    let _ = socket.emit(
+                        "call_error",
+                        json!({ "message": "missing to/from/offer" }),
+                    );
                     return;
                 }
 
-                if !st.online_users.contains_key(&to_user) {
-                    let _ = socket.emit("call_error", json!({ "message": "user_offline", "to": to_user }));
+                if !state.online_users.contains_key(&to_user) {
+                    let _ = socket.emit(
+                        "call_error",
+                        json!({ "message": "user_offline", "to": to_user }),
+                    );
                     return;
                 }
 
-                // 👉 GROK FIX: Emit thẳng vào Room của người gọi ban đầu
+                // Emit vào room username (không dùng sid)
+                let payload = json!({
+                    "from": from_user,
+                    "offer": data.offer,
+                    "callType": data.call_type.unwrap_or_else(|| "video".into()),
+                });
+                match socket.to(to_user.clone()).emit("incoming_call", payload) {
+                    Ok(_) => info!("[call_user] {} -> {} (room)", from_user, to_user),
+                    Err(e) => {
+                        warn!("[call_user] emit failed: {:?}", e);
+                        let _ = socket.emit(
+                            "call_error",
+                            json!({ "message": "deliver_failed", "to": to_user }),
+                        );
+                    }
+                }
+            },
+        );
+
+        socket.on(
+            "make_answer",
+            |socket: SocketRef, Data(data): Data<MakeAnswerPayload>, state: State<AppState>| async move {
+                let to_user = data.to.as_deref().map(norm).unwrap_or_default();
+                let from_user = resolve_from(&data.from, &socket.id.to_string(), &state);
+
+                if to_user.is_empty() || data.answer.is_none() {
+                    let _ = socket.emit(
+                        "call_error",
+                        json!({ "message": "missing to/answer" }),
+                    );
+                    return;
+                }
+                if !state.online_users.contains_key(&to_user) {
+                    let _ = socket.emit(
+                        "call_error",
+                        json!({ "message": "user_offline", "to": to_user }),
+                    );
+                    return;
+                }
+
                 let _ = socket.to(to_user.clone()).emit(
                     "call_answered",
-                    json!({ "from": from_user, "answer": answer }),
+                    json!({ "from": from_user, "answer": data.answer }),
                 );
-                info!("[make_answer] {} -> room [{}]", from_user, to_user);
-            }
-        });
+                info!("[make_answer] {} -> {}", from_user, to_user);
+            },
+        );
 
-        // ── ice_candidate ───────────────────────────────────
-        let st = io_state.clone();
-        socket.on("ice_candidate", move |socket: SocketRef, Data(data): Data<Value>| {
-            let st = st.clone();
-            async move {
-                let to_user = data.get("to").and_then(|v| v.as_str()).map(norm).unwrap_or_default();
-                let candidate = data.get("candidate");
-                if to_user.is_empty() || candidate.is_none() {
+        socket.on(
+            "ice_candidate",
+            |socket: SocketRef, Data(data): Data<IceCandidatePayload>, state: State<AppState>| async move {
+                let to_user = data.to.as_deref().map(norm).unwrap_or_default();
+                if to_user.is_empty() || data.candidate.is_none() {
                     return;
                 }
-                let from_user = resolve_from(&data, &socket.id.to_string(), &st);
-                
-                // 👉 GROK FIX: Bắn Candidate vào Room
+                if !state.online_users.contains_key(&to_user) {
+                    return;
+                }
+                let from_user = resolve_from(&data.from, &socket.id.to_string(), &state);
                 let _ = socket.to(to_user).emit(
                     "ice_candidate",
-                    json!({ "from": from_user, "candidate": candidate }),
+                    json!({ "from": from_user, "candidate": data.candidate }),
                 );
-            }
-        });
+            },
+        );
 
-        // ── end_call ────────────────────────────────────────
-        let st = io_state.clone();
-        socket.on("end_call", move |socket: SocketRef, Data(data): Data<Value>| {
-            let st = st.clone();
-            async move {
-                let to_user = data.get("to").and_then(|v| v.as_str()).map(norm).unwrap_or_default();
+        socket.on(
+            "end_call",
+            |socket: SocketRef, Data(data): Data<EndCallPayload>, state: State<AppState>| async move {
+                let to_user = data.to.as_deref().map(norm).unwrap_or_default();
                 if to_user.is_empty() {
                     return;
                 }
-                let from_user = resolve_from(&data, &socket.id.to_string(), &st);
-                let reason = data.get("reason").and_then(|v| v.as_str()).unwrap_or("hangup");
-                
-                let _ = socket.to(to_user.clone()).emit(
-                    "call_ended",
-                    json!({ "from": from_user, "reason": reason }),
-                );
-                info!("[end_call] {} -> room [{}] ({})", from_user, to_user, reason);
-            }
-        });
+                let from_user = resolve_from(&data.from, &socket.id.to_string(), &state);
+                let reason = data.reason.unwrap_or_else(|| "hangup".into());
+                if state.online_users.contains_key(&to_user) {
+                    let _ = socket.to(to_user.clone()).emit(
+                        "call_ended",
+                        json!({ "from": from_user, "reason": reason }),
+                    );
+                }
+                info!("[end_call] {} -> {} ({})", from_user, to_user, reason);
+            },
+        );
 
-        // ── reject_call ─────────────────────────────────────
-        let st = io_state.clone();
-        socket.on("reject_call", move |socket: SocketRef, Data(data): Data<Value>| {
-            let st = st.clone();
-            async move {
-                let to_user = data.get("to").and_then(|v| v.as_str()).map(norm).unwrap_or_default();
+        socket.on(
+            "reject_call",
+            |socket: SocketRef, Data(data): Data<EndCallPayload>, state: State<AppState>| async move {
+                let to_user = data.to.as_deref().map(norm).unwrap_or_default();
                 if to_user.is_empty() {
                     return;
                 }
-                let from_user = resolve_from(&data, &socket.id.to_string(), &st);
-                let _ = socket.to(to_user.clone()).emit(
-                    "call_ended",
-                    json!({ "from": from_user, "reason": "reject" }),
-                );
-                info!("[reject_call] {} -> room [{}]", from_user, to_user);
-            }
-        });
+                let from_user = resolve_from(&data.from, &socket.id.to_string(), &state);
+                if state.online_users.contains_key(&to_user) {
+                    let _ = socket.to(to_user.clone()).emit(
+                        "call_ended",
+                        json!({ "from": from_user, "reason": "reject" }),
+                    );
+                }
+                info!("[reject_call] {} -> {}", from_user, to_user);
+            },
+        );
 
-        // ── media_state ─────────────────────────────────────
-        let st = io_state.clone();
-        socket.on("media_state", move |socket: SocketRef, Data(data): Data<Value>| {
-            let st = st.clone();
-            async move {
-                let to_user = data.get("to").and_then(|v| v.as_str()).map(norm).unwrap_or_default();
+        socket.on(
+            "media_state",
+            |socket: SocketRef, Data(data): Data<MediaStatePayload>, state: State<AppState>| async move {
+                let to_user = data.to.as_deref().map(norm).unwrap_or_default();
                 if to_user.is_empty() {
                     return;
                 }
-                let from_user = resolve_from(&data, &socket.id.to_string(), &st);
+                if !state.online_users.contains_key(&to_user) {
+                    return;
+                }
+                let from_user = resolve_from(&data.from, &socket.id.to_string(), &state);
                 let _ = socket.to(to_user).emit(
                     "media_state",
                     json!({
                         "from": from_user,
-                        "video": data.get("video"),
-                        "audio": data.get("audio"),
+                        "video": data.video,
+                        "audio": data.audio,
                     }),
                 );
-            }
-        });
+            },
+        );
     });
 
     let health_state = state.clone();
@@ -281,7 +358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(5000);
     let addr = format!("0.0.0.0:{port}");
-    info!("Z-Chat signaling (Rust) listening on {addr}");
+    info!("Z-Chat signaling (Rust) on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
