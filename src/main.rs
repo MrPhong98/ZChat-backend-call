@@ -104,11 +104,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 st.online_users.insert(username.clone(), sid.clone());
                 st.sid_to_user.insert(sid, username.clone());
 
+                // 👉 GROK FIX: Cho socket gia nhập Room theo đúng Username của mình
+                let _ = socket.leave_all();
+                let _ = socket.join(username.clone());
+
                 let online: Vec<String> = st.online_users.iter().map(|e| e.key().clone()).collect();
 
                 let _ = socket.emit("registered", json!({ "username": &username, "online": online }));
                 let _ = socket.broadcast().emit("user_online", json!({ "username": &username }));
-                info!("[register] {} -> {}", username, socket.id);
+                info!("[register] {} joined room [{}] (sid={})", username, username, socket.id);
             }
         });
 
@@ -126,14 +130,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
 
-                let Some(target) = st.online_users.get(&to_user).map(|s| s.clone()) else {
+                if !st.online_users.contains_key(&to_user) {
                     let _ = socket.emit("call_error", json!({ "message": "user_offline", "to": to_user }));
                     return;
-                };
+                }
 
                 let call_type = data.get("callType").and_then(|v| v.as_str()).unwrap_or("video");
 
-                let _ = socket.to(target).emit(
+                // 👉 GROK FIX: Emit thẳng vào Room có tên là `to_user`
+                let _ = socket.to(to_user.clone()).emit(
                     "incoming_call",
                     json!({
                         "from": from_user,
@@ -141,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "callType": call_type,
                     }),
                 );
-                info!("[call_user] {} -> {}", from_user, to_user);
+                info!("[call_user] {} -> room [{}]", from_user, to_user);
             }
         });
 
@@ -159,16 +164,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
 
-                let Some(target) = st.online_users.get(&to_user).map(|s| s.clone()) else {
+                if !st.online_users.contains_key(&to_user) {
                     let _ = socket.emit("call_error", json!({ "message": "user_offline", "to": to_user }));
                     return;
-                };
+                }
 
-                let _ = socket.to(target).emit(
+                // 👉 GROK FIX: Emit thẳng vào Room của người gọi ban đầu
+                let _ = socket.to(to_user.clone()).emit(
                     "call_answered",
                     json!({ "from": from_user, "answer": answer }),
                 );
-                info!("[make_answer] {} -> {}", from_user, to_user);
+                info!("[make_answer] {} -> room [{}]", from_user, to_user);
             }
         });
 
@@ -183,10 +189,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
                 let from_user = resolve_from(&data, &socket.id.to_string(), &st);
-                let Some(target) = st.online_users.get(&to_user).map(|s| s.clone()) else {
-                    return;
-                };
-                let _ = socket.to(target).emit(
+                
+                // 👉 GROK FIX: Bắn Candidate vào Room
+                let _ = socket.to(to_user).emit(
                     "ice_candidate",
                     json!({ "from": from_user, "candidate": candidate }),
                 );
@@ -204,13 +209,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let from_user = resolve_from(&data, &socket.id.to_string(), &st);
                 let reason = data.get("reason").and_then(|v| v.as_str()).unwrap_or("hangup");
-                if let Some(target) = st.online_users.get(&to_user).map(|s| s.clone()) {
-                    let _ = socket.to(target).emit(
-                        "call_ended",
-                        json!({ "from": from_user, "reason": reason }),
-                    );
-                }
-                info!("[end_call] {} -> {} ({})", from_user, to_user, reason);
+                
+                let _ = socket.to(to_user.clone()).emit(
+                    "call_ended",
+                    json!({ "from": from_user, "reason": reason }),
+                );
+                info!("[end_call] {} -> room [{}] ({})", from_user, to_user, reason);
             }
         });
 
@@ -224,13 +228,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
                 let from_user = resolve_from(&data, &socket.id.to_string(), &st);
-                if let Some(target) = st.online_users.get(&to_user).map(|s| s.clone()) {
-                    let _ = socket.to(target).emit(
-                        "call_ended",
-                        json!({ "from": from_user, "reason": "reject" }),
-                    );
-                }
-                info!("[reject_call] {} -> {}", from_user, to_user);
+                let _ = socket.to(to_user.clone()).emit(
+                    "call_ended",
+                    json!({ "from": from_user, "reason": "reject" }),
+                );
+                info!("[reject_call] {} -> room [{}]", from_user, to_user);
             }
         });
 
@@ -244,10 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
                 let from_user = resolve_from(&data, &socket.id.to_string(), &st);
-                let Some(target) = st.online_users.get(&to_user).map(|s| s.clone()) else {
-                    return;
-                };
-                let _ = socket.to(target).emit(
+                let _ = socket.to(to_user).emit(
                     "media_state",
                     json!({
                         "from": from_user,
