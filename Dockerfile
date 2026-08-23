@@ -11,4 +11,4 @@ WORKDIR /app
 COPY --from=builder /app/target/release/zchat-signaling .
 EXPOSE 5000
 ENV PORT=5000
-CMD ["./zchat-signaling"]
+CMD ["./zchat-backend-call"]
