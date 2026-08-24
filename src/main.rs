@@ -106,7 +106,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let sid_str = sid_str.clone();
                 async move {
                     if let Some((_, username)) = st.sid_to_user.remove(&sid_str) {
-                        // Chỉ dọn dẹp nếu session ngắt kết nối đúng là session hiện tại
                         let is_current = st
                             .online_users
                             .get(&username)
