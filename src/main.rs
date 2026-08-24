@@ -1,6 +1,4 @@
 //! Z-Chat WebRTC signaling — Rust (Socket.IO / socketioxide)
-//! Fixed: Race conditions on re-registration, room cleanup, and stale sockets.
-
 use std::sync::Arc;
 use axum::{routing::get, Json, Router};
 use dashmap::DashMap;
