@@ -144,14 +144,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let sid = socket.id.to_string();
 
-                // Dọn dẹp session cũ hoàn toàn
                 if let Some((_, old_sid)) = state.online_users.remove(&username) {
                     if old_sid != sid {
                         state.sid_to_user.remove(&old_sid);
                     }
                 }
 
-                // Gia nhập Room theo username
                 if let Err(e) = socket.join(username.clone()) {
                     warn!("[register] join room failed for {}: {:?}", username, e);
                 }
@@ -238,7 +236,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 
                 let from_user = resolve_from(&data.from, &socket.id.to_string(), &state);
                 
-                // Trực tiếp broadcast vào room đối phương
                 let _ = socket.to(to_user).emit(
                     "ice_candidate",
                     json!({ "from": from_user, "candidate": data.candidate }),
