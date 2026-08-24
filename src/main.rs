@@ -1,4 +1,3 @@
-//! Z-Chat WebRTC signaling — Rust (Socket.IO / socketioxide)
 use std::sync::Arc;
 use axum::{routing::get, Json, Router};
 use dashmap::DashMap;
